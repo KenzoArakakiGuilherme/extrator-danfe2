@@ -1,57 +1,144 @@
-from flask import Flask, request, jsonify
-import os
+from flask import Flask, request, jsonify, send_file, render_template_string
+import tempfile, os
+import tabula
 import pandas as pd
-import tempfile
-import camelot
-from datetime import datetime
+import numpy as np
 
-app = Flask(__name__)
+app = Flask(_name_)
+
+def parse_produto_servico(pdf_path, arquivo_nome):
+    tables = tabula.read_pdf(
+        pdf_path,
+        pages="1",
+        multiple_tables=True,
+        stream=True
+    )
+
+    target = None
+    for tbl in tables:
+        if tbl.astype(str).apply(lambda col: col.str.contains("CÓDIGO", na=False)).any().any():
+            target = tbl
+            break
+    if target is None:
+        return []
+
+    df = target.copy()
+
+    hdr = df.iloc[0]
+    second = df.iloc[1]
+    orig_cols = df.columns
+    new_cols = [
+        (hdr[i] if pd.notna(hdr[i]) else f"{orig_cols[i]}{second[i]}")
+        for i in range(len(orig_cols))
+    ]
+    df.columns = new_cols
+    df = df.drop(df.index[0]).reset_index(drop=True)
+
+    df.columns = df.columns.str.replace(r"\.1", "", regex=True)
+    df = df.dropna(subset=["DESCRIÇÃO DO PRODUTO/SERVIÇO"])
+
+    df["CÓDIGO"] = df["CÓDIGO"].replace(r"^\s*$", np.nan, regex=True)
+    for idx in range(1, len(df)):
+        if pd.isna(df.at[idx, "CÓDIGO"]):
+            for col in df.columns:
+                if col == "CÓDIGO":
+                    continue
+                prev = str(df.at[idx - 1, col]).strip()
+                this = str(df.at[idx, col]).strip()
+                if this and this.lower() != "nan":
+                    df.at[idx - 1, col] = f"{prev} {this}".strip()
+    df = df[df["CÓDIGO"].notna()].reset_index(drop=True)
+
+    num_cols = [
+        "QTD.", "VLR. UNIT.", "V.DESC.", "VLR. TOTAL",
+        "BC. ICMS", "VLR. ICMS", "VLR. IPI", "ALÍQ.ICMS", "ALÍQ.IPI"
+    ]
+    for c in num_cols:
+        if c in df:
+            df[c] = (
+                df[c]
+                  .astype(str)
+                  .str.replace(r"\.", "", regex=True)
+                  .str.replace(",", ".", regex=False)
+                  .astype(float)
+            )
+
+    df["arquivo"] = arquivo_nome
+
+    return df.to_dict(orient="records")
+
+@app.route("/", methods=["GET"])
+def home():
+    return render_template_string("""
+    <!doctype html>
+    <html lang="pt-BR">
+      <head><meta charset="utf-8"><title>Upload NFe</title></head>
+      <body>
+        <h1>Envie seus PDFs de NFe</h1>
+        <form action="/upload" method="post" enctype="multipart/form-data">
+          <input type="file" name="arquivos" multiple>
+          <button type="submit">Upload</button>
+        </form>
+      </body>
+    </html>
+    """)
 
 @app.route("/upload", methods=["POST"])
-def upload_pdf():
-    if 'files' not in request.files:
-        return jsonify({"error": "No files part in the request"}), 400
+def upload():
+    arquivos = request.files.getlist("arquivos")
+    all_dados = []
 
-    files = request.files.getlist("files")
-    all_rows = []
+    for arquivo in arquivos:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        arquivo.save(tmp.name)
+        tmp.close()
 
-    for file in files:
-        if file.filename == '':
-            continue
+        all_dados.extend(parse_produto_servico(tmp.name, arquivo.filename))
+        os.remove(tmp.name)
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            file.save(tmp.name)
-            try:
-                tables = camelot.read_pdf(tmp.name, pages='all', flavor='lattice', strip_text='\n')
-                if tables.n == 0:
-                    raise ValueError("Nenhuma tabela encontrada com lattice, tentando stream...")
-            except Exception as e:
-                print(f"[fallback] {e}")
-                try:
-                    tables = camelot.read_pdf(tmp.name, pages='all', flavor='stream', strip_text='\n')
-                except Exception as fallback_error:
-                    print(f"[erro ao tentar stream] {fallback_error}")
-                    continue
+    df = pd.DataFrame(all_dados)
 
-            for table in tables:
-                df = table.df
-                for i, row in df.iterrows():
-                    all_rows.append([file.filename] + row.tolist())
+    cols = ['CÓDIGO', 'DESCRIÇÃO DO PRODUTO/SERVIÇO', 'NCM/SH', 'CST', 'CFOP',
+       'UNID.', 'QTD.', 'VLR. UNIT.', 'V.DESC.', 'VLR. TOTAL', 'BC. ICMS',
+       'VLR. ICMS', 'VLR. IPI', 'ALÍQ.ICMS', 'ALÍQ.IPI', 'arquivo']
 
-            os.unlink(tmp.name)
+    df = df[[c for c in cols if c in df.columns]]
 
-    if not all_rows:
-        return jsonify({"error": "Nenhum dado extraído dos PDFs."}), 400
+    df = df.rename(columns = {'arquivo': 'ARQUIVO'})
 
-    df = pd.DataFrame(all_rows)
-    return jsonify({
-        "preview_headers": df.columns.tolist(),
-        "preview_data": df.head(10).values.tolist()
-    })
+    tmp_xlsx = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    df.to_excel(tmp_xlsx.name, index=False)
+    app.config["ULTIMO_ARQUIVO"] = tmp_xlsx.name
 
-@app.route("/")
-def index():
-    return "<h2>API de Upload de PDFs DANFE</h2><p>Use o endpoint /upload via POST com arquivos PDFs.</p>"
+    table_html = df.to_html(classes="data", index=False, border=0)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    return render_template_string("""
+    <!doctype html>
+    <html lang="pt-BR">
+      <head>
+        <meta charset="utf-8">
+        <title>Resultados NFe</title>
+        <style>
+          table.data { border-collapse: collapse; width: 100%; }
+          table.data th, table.data td { border: 1px solid #ccc; padding: 4px; text-align: left; }
+        </style>
+      </head>
+      <body>
+        <h1>Dados extraídos</h1>
+        {{ table|safe }}
+        <p><a href="/baixar">⬇ Download resultados.xlsx</a></p>
+        <p><a href="/">↩️ Voltar</a></p>
+      </body>
+    </html>
+    """, table=table_html)
+
+@app.route("/baixar")
+def baixar_excel():
+    arquivo = app.config.get("ULTIMO_ARQUIVO")
+    if arquivo and os.path.exists(arquivo):
+        return send_file(arquivo, as_attachment=True, download_name="resultado.xlsx")
+    return "Nenhum arquivo gerado ainda.", 404
+
+if _name_ == "_main_":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
