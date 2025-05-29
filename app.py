@@ -1,4 +1,4 @@
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, jsonify
 import os
 import pandas as pd
 import tempfile
@@ -22,7 +22,6 @@ def upload_pdf():
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             file.save(tmp.name)
             try:
-                # Tenta com lattice
                 tables = camelot.read_pdf(tmp.name, pages='all', flavor='lattice', strip_text='\n')
                 if tables.n == 0:
                     raise ValueError("Nenhuma tabela encontrada com lattice, tentando stream...")
@@ -32,7 +31,7 @@ def upload_pdf():
                     tables = camelot.read_pdf(tmp.name, pages='all', flavor='stream', strip_text='\n')
                 except Exception as fallback_error:
                     print(f"[erro ao tentar stream] {fallback_error}")
-                    continue  # pula esse arquivo
+                    continue
 
             for table in tables:
                 df = table.df
@@ -44,11 +43,11 @@ def upload_pdf():
     if not all_rows:
         return jsonify({"error": "Nenhum dado extraído dos PDFs."}), 400
 
-    output_df = pd.DataFrame(all_rows)
-    output_path = os.path.join(tempfile.gettempdir(), f"saida_{datetime.now().timestamp()}.xlsx")
-    output_df.to_excel(output_path, index=False)
-
-    return send_file(output_path, as_attachment=True, download_name="notas_extraidas.xlsx")
+    df = pd.DataFrame(all_rows)
+    return jsonify({
+        "preview_headers": df.columns.tolist(),
+        "preview_data": df.head(10).values.tolist()
+    })
 
 @app.route("/")
 def index():
