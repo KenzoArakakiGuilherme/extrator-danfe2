@@ -1,0 +1,5 @@
+services:
+  - type: web
+    name: extrator-danfe
+    env: docker
+    plan: free
