@@ -22,13 +22,22 @@ def upload_pdf():
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             file.save(tmp.name)
             try:
+                # Tenta com lattice
                 tables = camelot.read_pdf(tmp.name, pages='all', flavor='lattice', strip_text='\n')
-                for table in tables:
-                    df = table.df
-                    for i, row in df.iterrows():
-                        all_rows.append([file.filename] + row.tolist())
+                if tables.n == 0:
+                    raise ValueError("Nenhuma tabela encontrada com lattice, tentando stream...")
             except Exception as e:
-                print(f"Erro ao processar {file.filename}: {e}")
+                print(f"[fallback] {e}")
+                try:
+                    tables = camelot.read_pdf(tmp.name, pages='all', flavor='stream', strip_text='\n')
+                except Exception as fallback_error:
+                    print(f"[erro ao tentar stream] {fallback_error}")
+                    continue  # pula esse arquivo
+
+            for table in tables:
+                df = table.df
+                for i, row in df.iterrows():
+                    all_rows.append([file.filename] + row.tolist())
 
             os.unlink(tmp.name)
 
